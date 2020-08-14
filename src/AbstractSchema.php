@@ -125,6 +125,137 @@ abstract class AbstractSchema implements SchemaInterface
 
     /**
      *
+     * Returns an array of columns in a table.
+     *
+     * @param string $table Return the columns in this table. This may be just
+     * a `table` name, or a `schema.table` name.
+     *
+     * @return Column[] An associative array where the key is the column name
+     * and the value is a Column object.
+     *
+     */
+    public function fetchTableCols($table)
+    {
+        $pos = strpos($table, '.');
+        if ($pos === false) {
+            $schema = $this->fetchCurrentSchema();
+        } else {
+            $schema = substr($table, 0, $pos);
+            $table = substr($table, $pos + 1);
+        }
+
+        $autoinc = $this->getAutoincSql();
+        $extended = $this->getExtendedSql();
+
+        $stm = "
+            SELECT
+                columns.column_name as _name,
+                columns.data_type as _type,
+                COALESCE(
+                    columns.character_maximum_length,
+                    columns.numeric_precision
+                ) AS _size,
+                columns.numeric_scale AS _scale,
+                CASE
+                    WHEN columns.is_nullable = 'YES' THEN 0
+                    ELSE 1
+                END AS _notnull,
+                columns.column_default AS _default,
+                {$autoinc} AS _autoinc,
+                CASE
+                    WHEN table_constraints.constraint_type = 'PRIMARY KEY' THEN 1
+                    ELSE 0
+                END AS _primary{$extended}
+            FROM information_schema.columns
+                LEFT JOIN information_schema.key_column_usage
+                    ON columns.table_schema = key_column_usage.table_schema
+                    AND columns.table_name = key_column_usage.table_name
+                    AND columns.column_name = key_column_usage.column_name
+                LEFT JOIN information_schema.table_constraints
+                    ON key_column_usage.table_schema = table_constraints.table_schema
+                    AND key_column_usage.table_name = table_constraints.table_name
+                    AND key_column_usage.constraint_name = table_constraints.constraint_name
+            WHERE columns.table_schema = :schema
+            AND columns.table_name = :table
+            ORDER BY columns.ordinal_position
+        ";
+
+        $defs = $this->pdoFetchAll($stm, ['schema' => $schema, 'table' => $table]);
+        $columns = $this->extractColumns($schema, $table, $defs);
+
+        $cols = [];
+
+        foreach ($columns as $name => $values) {
+            $cols[$name] = $this->column_factory->newInstance(
+                $name,
+                $values['type'],
+                $values['size'],
+                $values['scale'],
+                $values['notnull'],
+                $values['default'],
+                $values['autoinc'],
+                $values['primary']
+            );
+        }
+
+        return $cols;
+    }
+
+    protected function extractColumns(string $schema, string $table, array $defs)
+    {
+        $columns = [];
+        foreach ($defs as $def) {
+            if (isset($columns[$def['_name']])) {
+                $columns[$def['_name']]['primary'] = $columns[$def['_name']]['primary'] ?: (bool) $def['_primary'];
+                continue;
+            }
+            $columns[$def['_name']] = $this->extractColumn($schema, $table, $def);
+        }
+        return $columns;
+    }
+
+    protected function extractColumn(string $schema, string $table, array $def)
+    {
+        return [
+            'name' => $def['_name'],
+            'type' => $def['_type'],
+            'size' => isset($def['_size']) ? (int) $def['_size'] : null,
+            'scale' => isset($def['_scale']) ? (int) $def['_scale'] : null,
+            'notnull' => (bool) $def['_notnull'],
+            'default' => $this->extractDefault($def['_default'], $def['_type']),
+            'autoinc' => (bool) $def['_autoinc'],
+            'primary' => (bool) $def['_primary'],
+            'options' => null,
+        ];
+    }
+
+    protected function extractDefault($default, string $type)
+    {
+        $type = strtolower($type);
+        $default = $this->getDefault($default);
+
+        if ($default === null) {
+            return $default;
+        }
+
+        if (strpos($type, 'int') !== false) {
+            return (int) $default;
+        }
+
+        if ($type == 'float' || $type == 'double' || $type == 'real') {
+            return (float) $default;
+        }
+
+        return $default;
+    }
+
+    protected function getExtendedSql()
+    {
+        return '';
+    }
+
+    /**
+     *
      * Splits an identifier name into two parts, based on the location of the
      * first dot.
      *
@@ -236,4 +367,11 @@ abstract class AbstractSchema implements SchemaInterface
         $sth->execute($values);
         return $sth->fetchColumn(0);
     }
+
+    abstract public function fetchCurrentSchema();
+
+    abstract protected function getAutoincSql();
+
+    abstract protected function getDefault($default);
+
 }
